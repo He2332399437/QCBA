@@ -1,0 +1,191 @@
+import torch
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from train import ResNet_BiGRU_QwenFusion, TimeSeriesDataset, preprocess_data
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import numpy as np
+import json
+import matplotlib.cm as cm
+import seaborn as sns
+
+# ------------------- 路径配置 -------------------
+QWEN_MODEL_PATH = ''
+QWEN_WEIGHT_PATH = ''
+FUSION_MODEL_PATH = ""
+TEST_JSON_PATH = ""
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ------------------- 路径配置 -------------------
+def plot_tsne_distribution(features, labels, title, save_path):
+    tsne = TSNE(n_components=2, perplexity=15, init='random', learning_rate=200, random_state=42)
+    reduced = tsne.fit_transform(features)
+
+    plt.figure(figsize=(8, 8), dpi=300)
+    labels = np.array(labels)
+    unique_labels = np.unique(labels)
+
+    custom_colors = [
+        "#e41a1c",  # red
+        "#377eb8",  # blue
+        "#4daf4a",  # green
+        "#984ea3",  # purple
+        "#ff7f00",  # orange
+        "#a65628",  # brown
+        "#f781bf",  # pink
+        "#999999",  # gray
+        "#66c2a5",  # teal
+        "#a6cee3"   # light blue
+    ]
+
+    for i, label in enumerate(unique_labels):
+        idx = labels == label
+        plt.scatter(
+            reduced[idx, 0], reduced[idx, 1],
+            color=custom_colors[i % len(custom_colors)], label=str(label),
+            s=10, alpha=1, linewidths=0.2, edgecolors='none'
+        )
+
+    plt.legend(title="Class", fontsize=9, loc="best")
+    plt.title(title, fontsize=12)
+    plt.xticks([])
+    plt.yticks([])
+    plt.tight_layout()
+    plt.savefig(save_path)
+    print(f"✅ {title} 保存至 {save_path}")
+
+with open(TEST_JSON_PATH, 'r', encoding='utf-8') as f:
+    raw_data = json.load(f)
+
+texts, signals, labels = preprocess_data(raw_data)
+test_dataset = TimeSeriesDataset(texts, signals, labels)
+test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False)
+
+model = ResNet_BiGRU_QwenFusion(
+    qwen_model_path=QWEN_MODEL_PATH,
+    qwen_weight_path=QWEN_WEIGHT_PATH,
+    num_classes=10,
+    dropout=0.5
+).to(device)
+model.load_state_dict(torch.load(FUSION_MODEL_PATH, map_location=device))
+model.eval()
+
+if not hasattr(model, "extract_features"):
+    import types
+
+
+    def extract_features(self, x_signal, qwen_texts):
+        device = x_signal.device
+        signal_input = x_signal[:, :512].unsqueeze(1)
+
+        time = self.time_pool(self.time_resblock2(self.time_pool(self.time_resblock1(signal_input))))
+        time = time.permute(0, 2, 1)
+        time_out, _ = self.time_bigru(time)
+        time_feat = self.time_attention(time_out)
+
+        fft_result = torch.fft.rfft(signal_input.squeeze(1), dim=1)
+        mag = torch.abs(fft_result)
+        if mag.size(1) < 512:
+            mag = torch.nn.functional.pad(mag, (0, 512 - mag.size(1)))
+        mag = mag.unsqueeze(1)
+        freq = self.freq_pool(self.freq_resblock2(self.freq_pool(self.freq_resblock1(mag))))
+        freq = freq.permute(0, 2, 1)
+        freq_out, _ = self.freq_bigru(freq)
+        freq_feat = self.freq_attention(freq_out)
+
+        wavelets = []
+        import pywt
+        for i in range(signal_input.size(0)):
+            try:
+                coeff = pywt.wavedec(signal_input[i].cpu().numpy(), "db4", level=4)
+                flat = np.concatenate(coeff, axis=0) if coeff else np.zeros(512)
+            except:
+                flat = np.zeros(512)
+            wavelets.append(flat)
+        wavelets = torch.tensor(wavelets, dtype=torch.float32, device=device).unsqueeze(1)
+        wave = self.wavelet_pool(self.wavelet_resblock2(self.wavelet_pool(self.wavelet_resblock1(wavelets))))
+        wave = wave.permute(0, 2, 1)
+        wave_out, _ = self.wavelet_bigru(wave)
+        wave_feat = self.wavelet_attention(wave_out)
+
+        with torch.no_grad():
+            encoding = self.tokenizer(qwen_texts, padding=True, truncation=True, return_tensors="pt").to(device)
+            qwen_output = self.qwen_model(**encoding)
+            qwen_embed = qwen_output.last_hidden_state[:, 0, :]
+        qwen_feat = torch.nn.functional.relu(self.qwen_fc(self.dropout(qwen_embed)))
+
+        fused_feat = self.fusion(time_feat, freq_feat, wave_feat, qwen_feat)
+        return fused_feat
+
+
+    model.extract_features = types.MethodType(extract_features, model)
+
+
+gen_tokenizer = AutoTokenizer.from_pretrained(QWEN_MODEL_PATH, trust_remote_code=True)
+gen_model = AutoModelForCausalLM.from_pretrained(QWEN_MODEL_PATH, trust_remote_code=True).to(device)
+gen_model.eval()
+
+
+def generate_fault_explanation(label_text):
+    prompt = f"请根据预测结果解释该故障类别的可能原因与影响。\n故障类型：{label_text}\n故障解释："
+    inputs = gen_tokenizer(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        output = gen_model.generate(**inputs, max_new_tokens=50)
+    explanation = gen_tokenizer.decode(output[0], skip_special_tokens=True)
+    return explanation.split("故障解释：")[-1].strip()
+
+
+label_desc_map = {
+    0: "正常数据", 1: "内圈故障，故障直径7密耳", 2: "滚动体故障，故障直径7密耳",
+    3: "外圈故障，故障直径7密耳", 4: "内圈故障，故障直径14密耳",
+    5: "滚动体故障，故障直径14密耳", 6: "外圈故障，故障直径14密耳",
+    7: "内圈故障，故障直径21密耳", 8: "滚动体故障，故障直径21密耳", 9: "外圈故障，故障直径21密耳",
+}
+
+preds = []
+true_labels = []
+extracted_features = []
+
+print("\n=========== 故障预测与解释示例 ===========")
+
+with torch.no_grad():
+    for i, (x, y, qwen_texts) in enumerate(test_loader):
+        try:
+            x = x.to(device)
+            y = torch.tensor([int(lbl) for lbl in y], dtype=torch.long).to(device)
+
+            feat = model.extract_features(x, qwen_texts)
+            extracted_features.append(feat.cpu().numpy())
+
+            outputs = model(x, qwen_texts)
+            pred_labels = outputs.argmax(dim=1).cpu().tolist()
+
+            preds.extend(pred_labels)
+            true_labels.extend(y.cpu().tolist())
+
+        except Exception as e:
+            print(f"[ERROR] 在第 {i + 1} 批次推理时发生错误: {e}")
+            continue
+
+for i in range(min(10, len(preds))):
+    try:
+        true_label = true_labels[i]
+        pred_label = preds[i]
+        pred_desc = label_desc_map.get(pred_label, "未知类别")
+        explanation = generate_fault_explanation(pred_desc)
+
+        print(f"[样本{i + 1}] 实际标签: {true_label} | 预测标签: {pred_label}（{pred_desc}）")
+        print(f"         Qwen解释: {explanation}\n")
+
+    except Exception as e:
+        print(f"[ERROR] 样本{i + 1} 解释失败: {e}")
+
+print("=========== 预测统计 ===========")
+print(f"总预测样本数: {len(preds)}")
+correct = sum([int(p == t) for p, t in zip(preds, true_labels)])
+acc = correct / len(preds) if preds else 0.0
+print(f"预测正确数: {correct}")
+print(f"准确率: {acc:.4f}")
+
+features_np = np.concatenate(extracted_features, axis=0)
+labels_np = np.array(true_labels)
+plot_tsne_distribution(features_np, labels_np, "Test signal distribution", "E:/binghe/qwen/confusion_matrix/TS_1.5b_test.png")
