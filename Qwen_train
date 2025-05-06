@@ -1,0 +1,105 @@
+import json
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import numpy as np
+import os
+
+writer = SummaryWriter(log_dir="")
+with open("", "r") as f:
+    data = json.load(f)
+max_len = 512  
+
+def preprocess_data(data):
+    texts = []
+    labels = []
+    for item in data:
+        signal = item["signal"][:max_len]
+        # print("signal = ",signal)
+        if len(signal) < max_len:
+            signal += [0] * (max_len - len(signal))
+        features = item["features"]
+        label = int(item["label"])
+
+        signal_str = ",".join([f"{x:.4f}" for x in signal])
+        # print(" signal_str  = ",  signal_str )
+        features_str = ", ".join([f"{k}:{v:.4f}" for k, v in features.items()])
+        # print("features_str = ", features_str)
+        text = f"信号序列: [{signal_str}]; 特征: {{{features_str}}}"
+        # print("text = ", text)
+        texts.append(text)
+        labels.append(label)
+    return texts, labels
+
+texts, labels = preprocess_data(data)
+
+class QwenTimeSeriesDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer):
+        self.texts = texts
+        self.labels = torch.tensor(labels, dtype=torch.long)
+        self.tokenizer = tokenizer
+    def __len__(self):
+        return len(self.labels)
+    def __getitem__(self, idx):
+        encoding = self.tokenizer(
+            self.texts[idx],
+            truncation=True,
+            padding="max_length",
+            max_length=512,
+            return_tensors="pt"
+        )
+        return {
+            "input_ids": encoding["input_ids"].squeeze(0),
+            "attention_mask": encoding["attention_mask"].squeeze(0),
+            "labels": self.labels[idx]
+        }
+
+model_path = ''
+
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=len(set(labels))).cuda()
+
+dataset = QwenTimeSeriesDataset(texts, labels, tokenizer)
+dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+
+optimizer = optim.AdamW(model.parameters(), lr=2e-5)
+criterion = nn.CrossEntropyLoss()
+
+epochs = 10
+for epoch in range(epochs):
+    model.train()
+    total_loss = 0
+    correct = 0
+
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+
+    for batch in progress_bar:
+        input_ids = batch["input_ids"].cuda()
+        # print("input_ids = ",input_ids)
+        attention_mask = batch["attention_mask"].cuda()
+        # print("attention_mask = ",attention_mask)
+        label = batch["labels"].cuda()
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        # print("outputs = ",outputs)
+        loss = criterion(outputs.logits, label)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        preds = outputs.logits.argmax(dim=1)
+        correct += (preds == label).sum().item()
+        progress_bar.set_postfix(loss=loss.item())
+
+    acc = correct / len(dataset)
+    print(f"Epoch {epoch+1} | Loss: {total_loss:.4f} | Acc: {acc:.4f}")
+    writer.add_scalar("Loss/train", total_loss, epoch)
+    writer.add_scalar("Accuracy/train", acc, epoch)
+
+save_path = "E:/binghe/qwen/weights/qwen_0.5.pth"
+os.makedirs(os.path.dirname(save_path), exist_ok=True)
+torch.save(model.state_dict(), save_path)
+print(f"模型保存至: {save_path}")
