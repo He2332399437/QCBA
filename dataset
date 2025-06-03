@@ -1,0 +1,151 @@
+import os
+import json
+import random
+import numpy as np
+import scipy.io as sio
+
+step_size = 512 
+overlap_rate = 0.25 
+sample_length = 512  
+
+train_json_file = 'D:/yolo/code/qwen/output/data/features/train.json'
+test_json_file = 'D:/yolo/code/qwen/output/data/features/test.json' 
+
+os.makedirs(os.path.dirname(train_json_file), exist_ok=True)
+os.makedirs(os.path.dirname(test_json_file), exist_ok=True)
+
+FAULT_LABELS = {
+    "State Stability represents normal signals": 0,
+    "Micro-Corrosion of Shaft Core": 1,
+    "Ball Ring Light Fracture": 2,
+    "Frame Edge Initial Damage": 3,
+    "Core Component Cracking": 4,
+    "Roller Destruction": 5,
+    "Outer Layer Peeling": 6,
+    "Shaft Core Depression": 7,
+    "Column Disk Fragmentation": 8,
+    "Ring Wall Collapse": 9,
+}
+
+def extract_fault_label(folder_name):
+    for fault_type, label in FAULT_LABELS.items():
+        if fault_type in folder_name:
+            print(f"✅ 匹配成功: {folder_name} -> {fault_type} -> 类别 {label}")
+            return label
+    print(f"❌ 未匹配到类别: {folder_name}")
+    return None 
+
+def calculate_features(signal):
+    arr = np.array(signal, dtype=float)
+    mean_val = np.mean(arr)
+    std_val  = np.std(arr)
+    rms_val  = np.sqrt(np.mean(arr**2))
+    abs_mean = np.mean(np.abs(arr))
+    peak_val = np.max(np.abs(arr))
+    skew_val = (np.mean((arr - mean_val)**3) / (std_val**3)) if std_val != 0 else 0
+    kurt_val = (np.mean((arr - mean_val)**4) / (std_val**4)) if std_val != 0 else 0
+    crest_factor   = (peak_val / rms_val) if rms_val != 0 else 0
+    impulse_factor = (peak_val / abs_mean) if abs_mean != 0 else 0
+
+    return {
+        "Mean": mean_val,
+        "StdDev": std_val,
+        "RMS": rms_val,
+        "AbsMean": abs_mean,
+        "Peak": peak_val,
+        "Skew": skew_val,
+        "Kurt": kurt_val,
+        "CrestFactor": crest_factor,
+        "ImpulseFactor": impulse_factor
+    }
+
+def process_mat_file(file_path, label):
+    try:
+        mat_data = sio.loadmat(file_path)
+        possible_keys = ["X118_DE_time", "X222_DE_time", "X169_DE_time", "X130_DE_time", "X105_DE_time",
+                         "X197_DE_time", "X234_DE_time", "X185_DE_time", "X209_DE_time", "X097_DE_time"]
+        signal_key = next((key for key in possible_keys if key in mat_data), None)
+
+        if signal_key is None:
+            print(f"⚠️ {file_path} 没有找到匹配的信号键，跳过该文件！")
+            return []
+
+        time_series = mat_data[signal_key].flatten()
+        if len(time_series) < sample_length:
+            print(f"⚠️ {file_path} 信号长度过短 ({len(time_series)} < {sample_length})，跳过该文件！")
+            return []
+
+        segments = []
+        overlap = int(step_size * overlap_rate)
+        for start in range(0, len(time_series) - sample_length + 1, step_size - overlap):
+            segment = time_series[start: start + sample_length]
+            feature_values = calculate_features(segment)  
+            segments.append({
+                "signal": segment.tolist(),
+                "features": feature_values, 
+                "label": str(label)
+            })
+
+        print(f"✅ {file_path} 处理成功，共提取 {len(segments)} 片段")
+        return segments
+
+    except Exception as e:
+        print(f"❌ 处理 {file_path} 失败: {e}")
+        return []
+
+def process_folder(input_folders, train_json_file, test_json_file):
+    file_paths = []
+
+    for folder in input_folders:
+        label = extract_fault_label(folder) 
+        for root, _, files in os.walk(folder):
+            for file in files:
+                if file.endswith('.mat'):
+                    file_path = os.path.join(root, file)
+                    file_paths.append((file_path, label))
+
+    print(f"📂 处理前所有文件: {len(file_paths)}")
+
+    all_data = []
+    for idx, (file_path, label) in enumerate(file_paths):
+        print(f"Processing file {idx + 1}/{len(file_paths)}: {file_path}")
+        segments = process_mat_file(file_path, label)
+        all_data.extend(segments)
+
+    category_data = {str(i): [] for i in range(10)}
+    for entry in all_data:
+        category_data[entry["label"]].append(entry)
+
+    train_data, test_data = [], []
+
+    for label, data in category_data.items():
+        random.shuffle(data)  
+        split_idx = int(0.9 * len(data)) 
+        train_data.extend(data[:split_idx])
+        test_data.extend(data[split_idx:])
+
+    for label in range(10):
+        label = str(label)
+        if len(category_data[label]) == 0:
+            print(f"⚠️ 类别 {label} 没有数据！")
+        else:
+            print(f"✅ 类别 {label}: 训练 {len([d for d in train_data if d['label'] == label])} | 测试 {len([d for d in test_data if d['label'] == label])}")
+
+    random.shuffle(train_data)
+    random.shuffle(test_data)
+
+    with open(train_json_file, 'w', encoding='utf-8') as f:
+        json.dump(train_data, f, ensure_ascii=False, indent=4)
+
+    with open(test_json_file, 'w', encoding='utf-8') as f:
+        json.dump(test_data, f, ensure_ascii=False, indent=4)
+
+    print(f"✅ 训练数据 {len(train_data)} 条，已保存至 {train_json_file}")
+    print(f"✅ 测试数据 {len(test_data)} 条，已保存至 {test_json_file}")
+
+if __name__ == '__main__':
+    input_folders = [
+        'dataset_root'
+           ]
+
+    process_folder(input_folders, train_json_file, test_json_file)
