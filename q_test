@@ -1,0 +1,41 @@
+model_path = 'D:/yolo/ollama/Qwen2.5-1.5B-Instruct'
+weight_path = "qwen_1.5b.pth"
+sample_path = "data" 
+
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+model = AutoModelForSequenceClassification.from_pretrained(model_path, trust_remote_code=True, num_labels=10)
+model.load_state_dict(torch.load(weight_path, map_location="cuda"))
+model.eval().cuda()
+with open(sample_path, "r") as f:
+    test_data = json.load(f)
+
+max_len = 1024
+def preprocess_sample(item):
+    signal = item["signal"][:max_len]
+    if len(signal) < max_len:
+        signal += [0] * (max_len - len(signal))
+
+    features = item["features"]
+    signal_str = ",".join([f"{x:.4f}" for x in signal])
+    features_str = ", ".join([f"{k}:{v:.4f}" for k, v in features.items()])
+    text = f"信号序列: [{signal_str}]; 特征: {{{features_str}}}"
+    return text
+total = 0
+correct = 0
+
+for i, item in enumerate(test_data):
+    text = preprocess_sample(item)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding="max_length", max_length=512).to("cuda")
+    with torch.no_grad():
+        outputs = model(**inputs)
+        pred = outputs.logits.argmax(dim=1).item()
+    label = int(item["label"])
+    is_correct = (pred == label)
+    correct += int(is_correct)
+    total += 1
+    print(f"[样本 {i+1}] 预测: {pred} | 真实: {label} | {'✅正确' if is_correct else '❌错误'}")
+
+accuracy = correct / total if total > 0 else 0.0
+print(f"\n总样本数: {total}")
+print(f"预测正确数: {correct}")
+print(f"准确率 (Accuracy): {accuracy:.4f}")
